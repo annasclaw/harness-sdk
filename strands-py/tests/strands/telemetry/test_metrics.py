@@ -222,6 +222,7 @@ def test_tool_metrics_add_call(success, tool, tool_metrics, mock_get_meter_provi
     tru_attrs = dataclasses.asdict(tool_metrics)
     exp_attrs = {
         "tool": tool,
+        "tools": [tool],
         "call_count": 1,
         "success_count": success,
         "error_count": not success,
@@ -234,6 +235,52 @@ def test_tool_metrics_add_call(success, tool, tool_metrics, mock_get_meter_provi
     if success:
         metrics_client.tool_success_count.add.assert_called_with(1, attributes=attributes)
     assert tru_attrs == exp_attrs
+
+
+def test_tool_metrics_add_call_records_full_history(tool, mock_get_meter_provider):
+    """#301: add_call must record every invocation in ``tools``, not just the latest.
+
+    The previous behaviour stored only the latest invocation in ``self.tool``,
+    which silently dropped every earlier invocation's ``input``. We now keep
+    ``tool`` (= latest, for backward compat) AND ``tools`` (= full ordered history).
+    """
+    metrics_client = MetricsClient()
+    attributes = {"foo": "bar"}
+    duration = 0.1
+
+    invocations = [
+        dict(tool, **{"name": "weather", "toolUseId": "toolu_A", "input": {"city": "Berlin"}}),
+        dict(tool, **{"name": "weather", "toolUseId": "toolu_B", "input": {"city": "Paris"}}),
+        dict(tool, **{"name": "weather", "toolUseId": "toolu_C", "input": {"city": "Rome"}}),
+    ]
+
+    tool_metrics = strands.telemetry.metrics.ToolMetrics(tool)
+
+    for inv in invocations:
+        tool_metrics.add_call(inv, duration, True, metrics_client, attributes=attributes)
+
+    # ``tool`` keeps its backward-compat semantic (= latest invocation).
+    assert tool_metrics.tool == invocations[-1]
+    assert tool_metrics.call_count == 3
+    assert tool_metrics.success_count == 3
+    assert tool_metrics.error_count == 0
+    assert tool_metrics.total_time == pytest.approx(duration * 3)
+
+    # ``tools`` records the full ordered history of inputs (#301).
+    assert tool_metrics.tools == invocations
+    assert [t["input"]["city"] for t in tool_metrics.tools] == ["Berlin", "Paris", "Rome"]
+
+
+def test_tool_metrics_tools_empty_until_first_call(tool):
+    """``tools`` must remain an empty list until ``add_call`` is invoked.
+
+    Constructing a ``ToolMetrics`` directly (e.g. via dataclass replacement)
+    must not pre-populate ``tools`` with ``self.tool`` — the constructor is
+    invoked at ``setdefault`` time with the same tool that ``add_call`` is
+    about to receive, so pre-seeding would create a duplicate entry.
+    """
+    tool_metrics = strands.telemetry.metrics.ToolMetrics(tool)
+    assert tool_metrics.tools == []
 
 
 @unittest.mock.patch.object(strands.telemetry.metrics.time, "time")
@@ -313,6 +360,7 @@ def test_event_loop_metrics_add_tool_usage(mock_time, trace, tool, event_loop_me
                 success_count=1,
                 error_count=0,
                 total_time=duration,
+                tools=[tool],
             ),
         }
     }

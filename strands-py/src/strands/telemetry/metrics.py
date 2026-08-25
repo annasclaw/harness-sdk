@@ -110,7 +110,14 @@ class ToolMetrics:
     """Metrics for a specific tool's usage.
 
     Attributes:
-        tool: The tool being tracked.
+        tool: The most recent tool invocation passed to ``add_call``. Tracks
+            only the latest input/toolUseId, so its ``input`` reflects a
+            single call. For the full history of invocations (and their
+            inputs), iterate over ``tools``.
+        tools: All tool invocations recorded by ``add_call``, in the order
+            they were made. Empty until the first ``add_call``. Useful when
+            the same tool is invoked multiple times with different inputs
+            (see #301).
         call_count: Number of times the tool has been called.
         success_count: Number of successful tool calls.
         error_count: Number of failed tool calls.
@@ -122,6 +129,7 @@ class ToolMetrics:
     success_count: int = 0
     error_count: int = 0
     total_time: float = 0.0
+    tools: list[ToolUse] = field(default_factory=list)
 
     def add_call(
         self,
@@ -140,7 +148,8 @@ class ToolMetrics:
             metrics_client: The metrics client for recording the metrics.
             attributes: attributes of the metrics.
         """
-        self.tool = tool  # Update with latest tool state
+        self.tool = tool  # Latest tool state (backward-compat — see ``tools``)
+        self.tools.append(tool)  # Full invocation history (#301)
         self.call_count += 1
         self.total_time += duration
         metrics_client.tool_call_count.add(1, attributes=attributes)
