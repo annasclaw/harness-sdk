@@ -231,6 +231,7 @@ class Agent(AgentBase):
         checkpointing: bool = False,
         sandbox: Sandbox | None = None,
         storage: Storage | None = None,
+        max_iterations: int | None = None,
     ):
         """Initialize the Agent with the specified configuration.
 
@@ -339,9 +340,19 @@ class Agent(AgentBase):
                 auto-namespaces under its own prefix (e.g., ``offloader/``) to avoid key
                 collisions. Storage specified directly on a subsystem always takes
                 precedence over this agent-level default. Defaults to None.
+            max_iterations: Optional default cap on the number of model-then-tool cycles
+                per invocation. When set, every ``invoke_async`` / ``stream_async`` /
+                ``__call__`` that does not pass its own ``limits`` argument defaults to
+                ``limits={"turns": max_iterations}``. A per-invocation ``limits`` argument
+                always wins. When the cap fires, the loop terminates gracefully with
+                ``stop_reason="limit_turns"`` (no exception is raised). Mirrors the
+                pattern used by ``strands.multiagent.swarm.Swarm(max_iterations=...)``.
+                Must be a positive ``int`` when provided; ``bool`` is rejected. Defaults
+                to ``None`` (no cap), preserving prior unbounded behavior.
 
         Raises:
             ValueError: If agent id contains path separators.
+            TypeError: If ``max_iterations`` is not a positive ``int``.
         """
         self._model_router: ModelRouter | None = None
         if isinstance(model, ModelRouter):
@@ -494,6 +505,15 @@ class Agent(AgentBase):
         self._model_state: dict[str, Any] = {}
 
         self._concurrency = _ConcurrencyController(concurrent_invocation_mode)
+
+        # Optional constructor-level turn cap. When set, it acts as a default
+        # ``limits={"turns": max_iterations}`` for every invocation that does not pass
+        # its own ``limits`` kwarg. Validated up-front so misuse fails fast instead of
+        # at the first invoke; mirrors the bool-subclass-int gotcha in ``_validate_limits``.
+        if max_iterations is not None:
+            if isinstance(max_iterations, bool) or not isinstance(max_iterations, int) or max_iterations <= 0:
+                raise TypeError(f"max_iterations must be a positive int, got {max_iterations!r}")
+        self._max_iterations: int | None = max_iterations
 
         if (
             retry_strategy is not None
@@ -809,6 +829,40 @@ class Agent(AgentBase):
         """
         return self._concurrency.mode
 
+    def _resolve_limits(self, limits: Limits | None) -> Limits | None:
+        """Apply the constructor-level ``max_iterations`` cap as a default turn budget.
+
+        Semantics:
+            - ``limits=None`` and no ``max_iterations`` set → ``None`` (no caps, legacy
+              behavior).
+            - ``limits=None`` and ``max_iterations=N`` → ``{"turns": N}``.
+            - ``limits={...}`` (any dict, possibly empty) and no ``max_iterations`` →
+              caller's dict unchanged.
+            - ``limits={...}`` and ``max_iterations=N`` → caller's dict merged with
+              ``"turns": N`` unless the caller already set ``"turns"``. The constructor
+              value is a default that callers can extend (add more caps) but not
+              silently lose. To opt out of the constructor cap on one call, pass
+              ``limits={"turns": <large>}` or set ``turns`` explicitly to ``None`` is
+              not supported by the Limits TypedDict, so callers wanting "no turn cap"
+              per-call must construct a fresh agent or override ``turns`` with a
+              generous value.
+
+        Args:
+            limits: Caller-supplied per-invocation caps, or ``None``.
+
+        Returns:
+            The effective ``Limits`` to pass through to the event loop.
+        """
+        if self._max_iterations is None:
+            return limits
+        if limits is None:
+            return {"turns": self._max_iterations}
+        if "turns" not in limits:
+            merged: Limits = dict(limits)
+            merged["turns"] = self._max_iterations
+            return merged
+        return limits
+
     def __call__(
         self,
         prompt: AgentInput = None,
@@ -884,7 +938,7 @@ class Agent(AgentBase):
                 structured_output_model=structured_output_model,
                 structured_output_prompt=structured_output_prompt,
                 idempotency_token=idempotency_token,
-                limits=limits,
+                limits=self._resolve_limits(limits),
                 cancel_signal=cancel_signal,
                 **kwargs,
             )
@@ -976,7 +1030,7 @@ class Agent(AgentBase):
             structured_output_model=structured_output_model,
             structured_output_prompt=structured_output_prompt,
             idempotency_token=idempotency_token,
-            limits=limits,
+            limits=self._resolve_limits(limits),
             cancel_signal=cancel_signal,
             **kwargs,
         )
@@ -1321,6 +1375,7 @@ class Agent(AgentBase):
                     yield event["data"]
             ```
         """
+        limits = self._resolve_limits(limits)
         self._validate_limits(limits)
 
         begin = self._concurrency.begin(idempotency_token)

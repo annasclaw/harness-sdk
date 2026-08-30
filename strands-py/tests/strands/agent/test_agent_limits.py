@@ -246,3 +246,144 @@ async def test_invocation_hooks_fire_when_limit_trips():
 
     assert result.stop_reason == "limit_turns"
     assert seen == ["before", "after"]
+
+
+# ---------------------------------------------------------------------------
+# Constructor-level ``max_iterations`` — issue #2298
+#
+# ``Agent(max_iterations=N)`` applies ``{"turns": N}`` as a default turn cap on every
+# invocation that does not pass its own ``limits`` arg (or that passes a limits dict
+# without a ``turns`` key). Callers can extend (add more caps) or override (set
+# ``turns`` explicitly). Trip behavior matches per-invocation: ``stop_reason="limit_turns"``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_constructor_applies_default_turns_cap():
+    """``Agent(max_iterations=1)`` makes every invocation use ``limits={"turns": 1}``."""
+    agent = _agent(
+        [TOOL_USE_RESPONSE_1, TOOL_USE_RESPONSE_2],
+        usages=[_usage(10, 5), _usage(10, 5)],
+    )
+
+    capped = Agent(
+        model=agent.model,
+        tools=[loop],
+        max_iterations=1,
+    )
+
+    result = await capped.invoke_async("go")
+
+    assert result.stop_reason == "limit_turns"
+    assert result.metrics.latest_agent_invocation is not None
+    assert len(result.metrics.latest_agent_invocation.cycles) == 1
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_constructor_is_default_not_locked_in():
+    """A caller that sets ``turns`` explicitly in ``limits`` overrides the constructor cap."""
+    final_response = {"role": "assistant", "content": [{"text": "done"}]}
+    agent = Agent(
+        model=MockedModelProvider(
+            [TOOL_USE_RESPONSE_1, TOOL_USE_RESPONSE_2, final_response],
+            [_usage(10, 5), _usage(10, 5), _usage(10, 5)],
+        ),
+        tools=[loop],
+        max_iterations=1,  # would trip on its own at cycle 1
+    )
+
+    # Caller overrides with ``turns=5``: both tool-use cycles run, then the model returns final.
+    result = await agent.invoke_async("go", limits={"turns": 5})
+
+    assert result.stop_reason == "end_turn"
+    assert len(result.metrics.latest_agent_invocation.cycles) == 3
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_constructor_merges_with_caller_output_tokens_cap():
+    """Constructor ``max_iterations`` applies even when the caller sets a different cap."""
+    final_response = {"role": "assistant", "content": [{"text": "done"}]}
+    agent = Agent(
+        model=MockedModelProvider([final_response], [_usage(10, 50)]),
+        max_iterations=5,  # would NOT trip on its own; caller adds output_tokens cap
+    )
+
+    result = await agent.invoke_async("go", limits={"output_tokens": 100})
+
+    assert result.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_none_preserves_unbounded_behavior():
+    """Default ``max_iterations=None`` (no constructor arg) does not impose any cap."""
+    # 100 staged tool-use responses so an unintended cap would fire well before the end.
+    responses: list[dict] = [{"role": "assistant", "content": [{"toolUse": {"toolUseId": f"t-{i}", "name": "loop", "input": {}}}]} for i in range(20)]
+    usages = [_usage(5, 5)] * 20
+    # Add a final non-tool response so the loop terminates cleanly once the tool calls exhaust.
+    responses.append({"role": "assistant", "content": [{"text": "done"}]})
+    usages.append(_usage(5, 5))
+
+    agent = Agent(
+        model=MockedModelProvider(responses, usages),
+        tools=[loop],
+    )
+
+    result = await agent.invoke_async("go")
+
+    assert result.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_propagates_through_stream_async():
+    """Constructor cap applies to the streaming entry point too."""
+    agent = _agent(
+        [TOOL_USE_RESPONSE_1, TOOL_USE_RESPONSE_2],
+        usages=[_usage(10, 5), _usage(10, 5)],
+    )
+    capped = Agent(
+        model=agent.model,
+        tools=[loop],
+        max_iterations=1,
+    )
+
+    result = None
+    async for event in capped.stream_async("go"):
+        if "result" in event:
+            result = event["result"]
+
+    assert result is not None
+    assert result.stop_reason == "limit_turns"
+
+
+def test_max_iterations_propagates_through_call():
+    """The sync ``__call__`` path also inherits the constructor cap."""
+    agent = _agent(
+        [TOOL_USE_RESPONSE_1, TOOL_USE_RESPONSE_2],
+        usages=[_usage(10, 5), _usage(10, 5)],
+    )
+    capped = Agent(
+        model=agent.model,
+        tools=[loop],
+        max_iterations=1,
+    )
+
+    result = capped("go")
+
+    assert result.stop_reason == "limit_turns"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [0, -1, -100, True, False, 1.5, "5"],
+)
+def test_max_iterations_invalid_raises_type_error(bad_value):
+    """Bad constructor values fail fast with ``TypeError`` (same shape as ``_validate_limits``)."""
+    with pytest.raises(TypeError, match="max_iterations must be a positive int"):
+        Agent(model=MockedModelProvider([]), max_iterations=bad_value)
+
+
+def test_max_iterations_valid_positive_int_accepted():
+    """Sanity: any positive int is accepted; the cap is stored as-is."""
+    agent = Agent(model=MockedModelProvider([]), max_iterations=42)
+
+    assert agent._max_iterations == 42
