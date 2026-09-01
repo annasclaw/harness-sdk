@@ -294,6 +294,67 @@ class TestStrReplace:
         with pytest.raises(ValueError, match="directory"):
             await editor(command="str_replace", path=str(d), tool_context=ctx, old_str="OLD", new_str="NEW")
 
+    @pytest.mark.asyncio
+    async def test_preserves_tabs_in_untouched_lines(self, editor, ctx, tmp_path):
+        """Issue #4049: str_replace must not rewrite tabs outside the edited region."""
+        file_path = _write(tmp_path / "Makefile", "build:\n\tgcc -o app main.c\n\ntest:\n\tpytest tests/\n")
+        await editor(
+            command="str_replace",
+            path=file_path,
+            tool_context=ctx,
+            old_str="test:",
+            new_str="check:",
+        )
+        assert (
+            file_path.read_text()
+            == "build:\n\tgcc -o app main.c\n\ncheck:\n\tpytest tests/\n"
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_old_str_raises_clear_error(self, editor, ctx, tmp_path):
+        """Empty old_str should raise a clear error, not silently match every line."""
+        file_path = _write(tmp_path / "test.txt", "Line 1\nLine 2\nLine 3")
+        with pytest.raises(ValueError, match="must not be empty"):
+            await editor(command="str_replace", path=file_path, tool_context=ctx, old_str="", new_str="NEW")
+
+    @pytest.mark.asyncio
+    async def test_multi_line_old_str_line_numbers(self, editor, ctx, tmp_path):
+        """Multi-line old_str duplicate detection must report correct line numbers (not -1 for old broken behavior)."""
+        content = "foo\nbar\nbaz\nfoo\nbar"
+        file_path = _write(tmp_path / "test.txt", content)
+        with pytest.raises(ValueError, match=r"lines \[1, 4\]"):
+            await editor(
+                command="str_replace",
+                path=file_path,
+                tool_context=ctx,
+                old_str="foo\nbar",
+                new_str="REPL",
+            )
+
+    @pytest.mark.asyncio
+    async def test_replace_at_very_start(self, editor, ctx, tmp_path):
+        file_path = _write(tmp_path / "test.txt", "first line\nsecond\nthird")
+        await editor(
+            command="str_replace",
+            path=file_path,
+            tool_context=ctx,
+            old_str="first line",
+            new_str="new first",
+        )
+        assert file_path.read_text() == "new first\nsecond\nthird"
+
+    @pytest.mark.asyncio
+    async def test_replace_at_very_end(self, editor, ctx, tmp_path):
+        file_path = _write(tmp_path / "test.txt", "first\nlast line")
+        await editor(
+            command="str_replace",
+            path=file_path,
+            tool_context=ctx,
+            old_str="last line",
+            new_str="new last",
+        )
+        assert file_path.read_text() == "first\nnew last"
+
 
 class TestInsert:
     """The insert command."""
@@ -362,6 +423,22 @@ class TestInsert:
         d.mkdir()
         with pytest.raises(ValueError, match="directory"):
             await editor(command="insert", path=str(d), tool_context=ctx, insert_line=0, new_str="NEW")
+
+    @pytest.mark.asyncio
+    async def test_preserves_tabs_in_untouched_lines(self, editor, ctx, tmp_path):
+        """Issue #4049: insert must not rewrite tabs outside the inserted region."""
+        file_path = _write(tmp_path / "Makefile", "build:\n\tgcc -o app main.c\n\ntest:\n\tpytest tests/\n")
+        await editor(
+            command="insert",
+            path=file_path,
+            tool_context=ctx,
+            insert_line=0,
+            new_str=".PHONY: build test",
+        )
+        assert (
+            file_path.read_text()
+            == ".PHONY: build test\nbuild:\n\tgcc -o app main.c\n\ntest:\n\tpytest tests/\n"
+        )
 
 
 class TestFileSizeLimit:
