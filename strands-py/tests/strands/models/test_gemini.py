@@ -1587,6 +1587,78 @@ def test_format_request_filters_s3_source_image(model, caplog):
     assert "Location sources are not supported by Gemini" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("video_format", "exp_mime_type"),
+    [
+        ("flv", "video/x-flv"),
+        ("mkv", "video/x-matroska"),
+        ("mov", "video/quicktime"),
+        ("mpeg", "video/mpeg"),
+        ("mpg", "video/mpeg"),
+        ("mp4", "video/mp4"),
+        ("three_gp", "video/3gpp"),
+        ("webm", "video/webm"),
+        ("wmv", "video/x-ms-wmv"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stream_request_with_video(video_format, exp_mime_type, gemini_client, model, model_id):
+    """Video blocks with inline bytes are sent as inline data with the format's MIME type."""
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"text": "describe this video"},
+                {"video": {"format": video_format, "source": {"bytes": b"videobytes"}}},
+            ],
+        },
+    ]
+    await anext(model.stream(messages))
+
+    exp_request = {
+        "config": {},
+        "contents": [
+            {
+                "parts": [
+                    {"text": "describe this video"},
+                    {"inline_data": {"data": "dmlkZW9ieXRlcw==", "mime_type": exp_mime_type}},
+                ],
+                "role": "user",
+            },
+        ],
+        "model": model_id,
+    }
+    gemini_client.aio.models.generate_content_stream.assert_called_with(**exp_request)
+
+
+def test_format_request_filters_s3_source_video(model, caplog):
+    """Test that videos with Location sources are filtered out with warning."""
+    caplog.set_level(logging.WARNING, logger="strands.models.gemini")
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"text": "look at this video"},
+                {
+                    "video": {
+                        "format": "mp4",
+                        "source": {"location": {"type": "s3", "uri": "s3://my-bucket/video.mp4"}},
+                    },
+                },
+            ],
+        },
+    ]
+
+    request = model._format_request(messages, None, None, None)
+
+    # Video with S3 source should be filtered, text should remain
+    formatted_content = request["contents"][0]["parts"]
+    assert len(formatted_content) == 1
+    assert "text" in formatted_content[0]
+    assert "Location sources are not supported by Gemini" in caplog.text
+
+
 def test_format_request_skips_message_cache_point(model, caplog):
     caplog.set_level(logging.WARNING, logger="strands.models.gemini")
 
