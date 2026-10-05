@@ -506,7 +506,16 @@ class OpenAIModel(Model):
             ),
             "model": self.config["model_id"],
             "stream": stream,
-            "tools": [
+            **(self._format_request_tool_choice(tool_choice)),
+            **params,
+        }
+
+        # An empty "tools" array is rejected by OpenAI-compatible servers (vLLM raises
+        # HTTP 400: `tools` must not be an empty array). Omit the key entirely when the
+        # agent has no tools so tool-less calls, including conversation-manager summaries,
+        # reach the model.
+        if tool_specs:
+            request["tools"] = [
                 {
                     "type": "function",
                     "function": {
@@ -515,11 +524,8 @@ class OpenAIModel(Model):
                         "parameters": tool_spec["inputSchema"]["json"],
                     },
                 }
-                for tool_spec in tool_specs or []
-            ],
-            **(self._format_request_tool_choice(tool_choice)),
-            **params,
-        }
+                for tool_spec in tool_specs
+            ]
 
         if stream:
             request["stream_options"] = stream_options
