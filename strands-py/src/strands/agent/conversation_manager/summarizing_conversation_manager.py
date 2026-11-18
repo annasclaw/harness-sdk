@@ -1,23 +1,19 @@
 """Summarizing conversation history management with configurable options."""
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional
 
 from typing_extensions import override
 
 from ..._async import run_async
 from ...hooks.events import AfterModelCallEvent
 from ...hooks.registry import HookRegistry
-from ...tools._tool_helpers import noop_tool
-from ...tools.registry import ToolRegistry
 from ...types.content import Message, _ensure_tracking_id
 from ...types.exceptions import ContextWindowOverflowException
-from ...types.tools import AgentTool
 from ..invocation_context import InvocationContext
 from .compression.context_compression import (
     DEFAULT_SUMMARIZATION_PROMPT,
     adjust_split_point_for_tool_pairs,
-    as_user_summary,
     generate_summary,
 )
 from .compression.pin_message import apply_pin_first, partition_pinned
@@ -302,7 +298,18 @@ class SummarizingConversationManager(ConversationManager):
     def _generate_summary_with_agent(
         self, messages: list[Message], invocation_context: InvocationContext | None = None
     ) -> Message:
-        """Generate a summary using the dedicated summarization agent.
+        """Generate a summary using the dedicated summarization agent's model.
+
+        The dedicated agent's model is called directly, without the agent pipeline, so the
+        summarizer cannot run tools. A summarizer that answers with a ``toolUse`` block for
+        a tool it does not have used to have that call fail inside the agent event loop, be
+        fed back to the model, and end up describing the failed call as history. Here the
+        reply's ``toolUse`` blocks are simply dropped: the summary keeps the model's text
+        and nothing is executed.
+
+        The agent's own system prompt and model are used, so a dedicated summarizer keeps
+        the behaviour it was configured for. Its tool registry is left untouched, and its
+        state (messages, system prompt, tool registry) is never modified.
 
         Args:
             messages: The messages to summarize.
@@ -314,37 +321,14 @@ class SummarizingConversationManager(ConversationManager):
         summarization_agent = self.summarization_agent
         assert summarization_agent is not None  # guaranteed by caller
 
-        original_system_prompt = summarization_agent.system_prompt
-        original_messages = summarization_agent.messages.copy()
-        original_tool_registry = summarization_agent.tool_registry
-        original_structured_output_model = getattr(summarization_agent, "_default_structured_output_model", None)
-
-        try:
-            # Disable structured output for summarization. Summaries are plain text and
-            # structured output adds toolUse blocks that are invalid in user messages.
-            if hasattr(summarization_agent, "_default_structured_output_model"):
-                summarization_agent._default_structured_output_model = None
-
-            # Add no-op tool if agent has no tools to satisfy tool spec requirement
-            if not summarization_agent.tool_names:
-                tool_registry = ToolRegistry()
-                tool_registry.register_tool(cast(AgentTool, noop_tool))
-                summarization_agent.tool_registry = tool_registry
-
-            summarization_agent.messages = messages
-
-            invoke_kwargs: dict[str, Any] = (
-                {"invocation_context": invocation_context} if invocation_context is not None else {}
+        return run_async(
+            lambda: generate_summary(
+                messages,
+                summarization_agent.model,
+                summarization_agent.system_prompt,
+                invocation_context,
             )
-            result = summarization_agent("Please summarize this conversation.", **invoke_kwargs)
-            return as_user_summary(result.message)
-
-        finally:
-            summarization_agent.system_prompt = original_system_prompt
-            summarization_agent.messages = original_messages
-            summarization_agent.tool_registry = original_tool_registry
-            if hasattr(summarization_agent, "_default_structured_output_model"):
-                summarization_agent._default_structured_output_model = original_structured_output_model
+        )
 
     # ------------------------------------------------------------------
     # Path 2 – default case: call model.stream() directly

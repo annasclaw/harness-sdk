@@ -41,6 +41,31 @@ async def _mock_model_stream_with_usage(response_text, usage):
     yield {"metadata": {"usage": usage, "metrics": {"latencyMs": 0}}}
 
 
+async def _mock_model_stream_with_reasoning():
+    """A model reply that carries a reasoning block next to its text."""
+    yield {"messageStart": {"role": "assistant"}}
+    yield {"contentBlockStart": {"start": {}}}
+    reasoning = {"reasoningText": {"text": "thinking", "signature": "sig"}}
+    yield {"contentBlockDelta": {"delta": {"reasoningContent": reasoning}}}
+    yield {"contentBlockStop": {}}
+    yield {"contentBlockStart": {"start": {}}}
+    yield {"contentBlockDelta": {"delta": {"text": "Summary"}}}
+    yield {"contentBlockStop": {}}
+    yield {"messageStop": {"stopReason": "end_turn"}}
+
+
+async def _mock_model_stream_with_tool_use():
+    """A model reply that carries a toolUse block next to its text."""
+    yield {"messageStart": {"role": "assistant"}}
+    yield {"contentBlockStart": {"start": {"toolUse": {"name": "apply_patch", "toolUseId": "tool-1"}}}}
+    yield {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}}
+    yield {"contentBlockStop": {}}
+    yield {"contentBlockStart": {"start": {}}}
+    yield {"contentBlockDelta": {"delta": {"text": "Summary without the tool call"}}}
+    yield {"contentBlockStop": {}}
+    yield {"messageStop": {"stopReason": "tool_use"}}
+
+
 async def _mock_model_stream_error(error):
     """Async generator that raises an exception, simulating a model failure."""
     raise error
@@ -423,12 +448,16 @@ def test_summary_call_is_not_repeated_while_the_overflowed_range_is_unchanged(mo
 
 def test_summary_call_is_retried_each_round_when_a_summarization_agent_overflows(mock_agent):
     """A summarization agent with tools is not deterministic, so its overflow does not arm the range fingerprint."""
-    summarization_agent = Mock(side_effect=ContextWindowOverflowException("Input is too long"))
+    summarization_agent = Mock()
     summarization_agent.system_prompt = None
     summarization_agent.messages = []
     summarization_agent.tool_registry = Mock()
     summarization_agent.tool_names = []
     summarization_agent._default_structured_output_model = None
+    summarization_agent.model = Mock()
+    summarization_agent.model.stream = Mock(
+        side_effect=lambda *a, **kw: _mock_model_stream_error(ContextWindowOverflowException("Input is too long"))
+    )
     manager = SummarizingConversationManager(
         summary_ratio=0.5, preserve_recent_messages=2, summarization_agent=summarization_agent
     )
@@ -442,7 +471,7 @@ def test_summary_call_is_retried_each_round_when_a_summarization_agent_overflows
     manager.reduce_context(mock_agent, e=RuntimeError("overflow"))
     manager.reduce_context(mock_agent, e=RuntimeError("overflow"))
 
-    assert summarization_agent.call_count == 2
+    assert summarization_agent.model.stream.call_count == 2
     assert mock_agent.messages[0]["content"][0]["text"] == _truncated("a" * 20_000)
     assert mock_agent.messages[2]["content"][0]["text"] == _truncated("p" * 50_000)
 
@@ -728,16 +757,9 @@ def test_summarization_agent_reasoning_blocks_are_dropped_from_summary():
     """A reasoning summarizer's reply is re-roled as user with only its text kept."""
 
     class ReasoningMockAgent(MockAgent):
-        def __call__(self, prompt):
-            result = Mock()
-            result.message = {
-                "role": "assistant",
-                "content": [
-                    {"reasoningContent": {"reasoningText": {"text": "thinking", "signature": "sig"}}},
-                    {"text": "Summary"},
-                ],
-            }
-            return result
+        def __init__(self):
+            super().__init__()
+            self.model.stream = Mock(side_effect=lambda *a, **kw: _mock_model_stream_with_reasoning())
 
     manager = SummarizingConversationManager(summarization_agent=cast("Agent", ReasoningMockAgent()))
     messages: Messages = [
@@ -795,8 +817,11 @@ def test_uses_summarization_agent_when_provided():
     summary_content = summary["content"][0]
     assert "text" in summary_content and summary_content["text"] == "Custom summary from dedicated agent"
 
-    # Assert that the summarization agent was called
-    summary_agent.call_tracker.assert_called_once()
+    # The dedicated agent's model is called directly, and the agent itself is not invoked:
+    # invoking it would run the tool loop, and the summarizer would then be able to execute
+    # tools and summarise their failures as history.
+    summary_agent.call_tracker.assert_not_called()
+    summary_agent.model.stream.assert_called_once()
 
 
 def test_default_path_calls_model_directly():
@@ -955,8 +980,11 @@ def test_agent_path_state_restoration_on_exception():
     summary_agent.system_prompt = "Original prompt"
     agent_messages: Messages = [{"role": "user", "content": [{"text": "Original"}]}]
     summary_agent.messages = agent_messages
-    summary_agent.side_effect = Exception("Summarization failed")
     summary_agent.tool_names = []
+    summary_agent.model = Mock()
+    summary_agent.model.stream = Mock(
+        side_effect=lambda *a, **kw: _mock_model_stream_error(Exception("Summarization failed"))
+    )
 
     manager = SummarizingConversationManager(summarization_agent=cast("Agent", summary_agent))
 
@@ -1174,14 +1202,10 @@ def test_summarizing_conversation_manager_properly_records_removed_message_count
     assert manager.removed_message_count == 5
 
 
-@patch("strands.agent.conversation_manager.summarizing_conversation_manager.ToolRegistry")
-def test_summarizing_conversation_manager_generate_summary_with_noop_tool_agent_path(
-    mock_registry_cls,
-):
-    """Test noop tool registration when using the agent path (summarization_agent provided)."""
-    mock_registry = mock_registry_cls.return_value
-
+def test_summarizing_conversation_manager_agent_path_calls_the_model_without_tool_specs():
+    """The dedicated summarizer's model is called with no tool specs, and its registry is untouched."""
     summary_agent = create_mock_agent()
+    summary_agent.tool_names = ["test_tool"]
     manager = SummarizingConversationManager(
         summary_ratio=0.5,
         preserve_recent_messages=2,
@@ -1194,19 +1218,17 @@ def test_summarizing_conversation_manager_generate_summary_with_noop_tool_agent_
     original_tool_registry = summary_agent.tool_registry
     manager._generate_summary(messages, parent_agent)
 
-    assert original_tool_registry == summary_agent.tool_registry
-    mock_registry.register_tool.assert_called_once()
+    # No tool spec is offered, so the summarizer has no tool it could call.
+    call = summary_agent.model.stream.call_args
+    assert call.args[1] is None
+    # The agent's own tool registry is not swapped out.
+    assert summary_agent.tool_registry is original_tool_registry
 
 
-@patch("strands.agent.conversation_manager.summarizing_conversation_manager.ToolRegistry")
-def test_summarizing_conversation_manager_generate_summary_with_tools_agent_path(
-    mock_registry_cls,
-):
-    """Test no noop tool registration when summarization_agent has tools."""
-    mock_registry = mock_registry_cls.return_value
-
+def test_summarizing_conversation_manager_agent_path_drops_a_tool_use_reply():
+    """A summarizer that answers with a toolUse block never runs it and never summarises it."""
     summary_agent = create_mock_agent()
-    summary_agent.tool_names = ["test_tool"]
+    summary_agent.model.stream = Mock(side_effect=lambda *a, **kw: _mock_model_stream_with_tool_use())
     manager = SummarizingConversationManager(
         summary_ratio=0.5,
         preserve_recent_messages=2,
@@ -1216,28 +1238,22 @@ def test_summarizing_conversation_manager_generate_summary_with_tools_agent_path
     messages = [{"role": "user", "content": [{"text": "test"}]}]
     parent_agent = create_mock_agent()
 
-    manager._generate_summary(messages, parent_agent)
+    summary = manager._generate_summary(messages, parent_agent)
 
-    mock_registry.register_tool.assert_not_called()
+    # Only the text survives; the toolUse block is dropped and never executed.
+    assert summary == {"role": "user", "content": [{"text": "Summary without the tool call"}]}
+    summary_agent.call_tracker.assert_not_called()
 
 
-def test_generate_summary_disables_structured_output_on_summarization_agent():
-    """Test that structured output is disabled during summarization to avoid toolUse in user messages.
+def test_generate_summary_never_invokes_the_summarization_agent():
+    """The dedicated summarizer is never invoked, so its structured output model is never used or changed.
 
-    When a summarization agent has structured_output_model configured, the response contains toolUse blocks.
-    Since the summary is converted to a user message, toolUse blocks would violate the model API constraint
-    that user messages cannot contain tool uses. The fix disables structured output during summarization.
+    Invoking the agent would run the tool loop and add structured-output toolUse blocks to the
+    reply, which then have to be stripped. The agent's model is called directly instead.
     """
     summary_agent = create_mock_agent()
     structured_output_model = Mock()
     summary_agent._default_structured_output_model = structured_output_model
-
-    original_call = summary_agent.__class__.__call__
-    observed_values = []
-
-    def tracking_call(self, prompt):
-        observed_values.append(self._default_structured_output_model)
-        return original_call(self, prompt)
 
     messages: Messages = [
         {"role": "user", "content": [{"text": "Hello"}]},
@@ -1245,12 +1261,10 @@ def test_generate_summary_disables_structured_output_on_summarization_agent():
     ]
 
     manager = SummarizingConversationManager(summarization_agent=summary_agent)
+    manager._generate_summary(messages, create_mock_agent())
 
-    with patch.object(MockAgent, "__call__", tracking_call):
-        manager._generate_summary(messages, create_mock_agent())
-
-    assert observed_values == [None], "structured output should be disabled during summarization"
-    assert summary_agent._default_structured_output_model is structured_output_model, "should be restored after"
+    summary_agent.call_tracker.assert_not_called()
+    assert summary_agent._default_structured_output_model is structured_output_model, "should be left untouched"
 
 
 # ==============================================================================
@@ -1370,10 +1384,12 @@ def test_summarization_usage_joins_the_request_total_even_when_the_request_limit
 
 
 def test_summarization_agent_path_joins_the_request():
-    summary_agent = MagicMock()
-    summary_agent.tool_names = []
-    summary_agent.messages = []
-    summary_agent.return_value.message = {"role": "assistant", "content": [{"text": "Agent summary"}]}
+    summary_agent = create_mock_agent()
+    summary_agent.model.stream = Mock(
+        side_effect=lambda *a, **kw: _mock_model_stream_with_usage(
+            "Agent summary", {"inputTokens": 4, "outputTokens": 5, "totalTokens": 9}
+        )
+    )
     manager = SummarizingConversationManager(
         summary_ratio=0.5, preserve_recent_messages=2, summarization_agent=summary_agent
     )
@@ -1390,4 +1406,4 @@ def test_summarization_agent_path_joins_the_request():
 
     manager.reduce_context(agent, e=ContextWindowOverflowException("overflow"), invocation_context=handed)
 
-    assert summary_agent.call_args.kwargs == {"invocation_context": handed}
+    assert request.usage == {"turns_taken": 5, "inputTokens": 4, "outputTokens": 5, "totalTokens": 9}
