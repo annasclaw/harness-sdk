@@ -1,6 +1,7 @@
 """Tests for LocalFileStorage."""
 
 import os
+import stat
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -360,3 +361,71 @@ class TestLocalFileStorage:
         assert bound._search_strategy is None
         assert len(caught) == 1
         assert "requires host filesystem access" in str(caught[0].message)
+
+    @pytest.mark.asyncio
+    async def test_write_creates_private_directories_and_files(self, tmp_path):
+        """Directories are 0o700 and files 0o600, regardless of the umask."""
+        root = tmp_path / "storage"
+        storage = LocalFileStorage(str(root) + "/")
+
+        previous_umask = os.umask(0o022)
+        try:
+            await storage.write("s1/snapshot.json", b"{}")
+        finally:
+            os.umask(previous_umask)
+
+        def mode(target):
+            return oct(stat.S_IMODE(os.stat(target).st_mode))
+
+        assert mode(root) == "0o700"
+        assert mode(root / "s1") == "0o700"
+        assert mode(root / "s1" / "snapshot.json") == "0o600"
+
+    @pytest.mark.asyncio
+    async def test_write_creates_intermediate_directories_private(self, tmp_path):
+        """Every intermediate directory is private, not only the leaf."""
+        root = tmp_path / "storage"
+        storage = LocalFileStorage(str(root) + "/")
+
+        previous_umask = os.umask(0o022)
+        try:
+            await storage.write("a/b/c/file.txt", b"deep")
+        finally:
+            os.umask(previous_umask)
+
+        def mode(target):
+            return oct(stat.S_IMODE(os.stat(target).st_mode))
+
+        for part in ("a", "a/b", "a/b/c"):
+            assert mode(root / part) == "0o700"
+        assert mode(root / "a/b/c/file.txt") == "0o600"
+
+    @pytest.mark.asyncio
+    async def test_read_refuses_symlink(self, tmp_path):
+        """A key whose file is a symlink is refused, not read through."""
+        root = tmp_path / "storage"
+        root.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside")
+
+        storage = LocalFileStorage(str(root) + "/")
+        os.symlink(str(outside), str(root / "linked.json"))
+
+        with pytest.raises(StorageError):
+            await storage.read("linked.json")
+
+    @pytest.mark.asyncio
+    async def test_write_refuses_symlink(self, tmp_path):
+        """A key whose file is a symlink is refused, not written through."""
+        root = tmp_path / "storage"
+        root.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside")
+
+        storage = LocalFileStorage(str(root) + "/")
+        os.symlink(str(outside), str(root / "linked.json"))
+
+        with pytest.raises(StorageError):
+            await storage.write("linked.json", b"replacement")
+
+        assert outside.read_text() == "outside"

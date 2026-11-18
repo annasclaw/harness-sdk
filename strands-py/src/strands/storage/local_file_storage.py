@@ -21,6 +21,38 @@ if TYPE_CHECKING:
 _INTERNAL_PREFIX = ".__strands_"
 
 
+def _ensure_secure_dir(path: str) -> None:
+    """Create ``path`` and any missing parents with private (0o700) permissions.
+
+    ``os.makedirs(mode=...)`` applies the mode to the leaf directory only, and the
+    mode is masked by the process umask. Directories are therefore created one
+    level at a time and chmod'ed explicitly, so every directory this storage
+    creates is private regardless of the umask in effect.
+    """
+    path = os.path.abspath(path)
+
+    missing: list[str] = []
+    current = path
+    while current and not os.path.isdir(current):
+        missing.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            if not os.path.isdir(directory):
+                raise
+            continue
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+
+
 class LocalFileStorage:
     """Persists each key as a file under a base directory.
 
@@ -132,12 +164,30 @@ class LocalFileStorage:
                 return
 
             parent = os.path.dirname(path)
-            os.makedirs(parent, exist_ok=True)
+            _ensure_secure_dir(parent)
+
+            # Refuse to write through a symlink at the key (symlink attack).
+            if os.path.islink(path):
+                raise StorageError(f"Refusing to write to symlink at {path}. This may indicate a symlink attack.")
 
             tmp_path = os.path.join(parent, f"{_INTERNAL_PREFIX}tmp_{uuid.uuid4().hex}")
             try:
-                with open(tmp_path, "wb") as f:
-                    f.write(data)
+                # O_EXCL creates the scratch file exclusively; 0o600 keeps it private
+                # regardless of the umask in effect.
+                fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(data)
+                except BaseException:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise
+                try:
+                    os.chmod(tmp_path, 0o600)
+                except OSError:
+                    pass
                 os.replace(tmp_path, path)
             except BaseException:
                 try:
@@ -175,8 +225,22 @@ class LocalFileStorage:
             if self._sandbox is not None:
                 return await self._sandbox.read_file(path)
 
-            with open(path, "rb") as f:
-                return f.read()
+            # Refuse to read through a symlink at the key (symlink attack).
+            if os.path.islink(path):
+                raise StorageError(f"Refusing to read symlink at {path}. This may indicate a symlink attack.")
+
+            # O_NOFOLLOW closes the check-then-open race on the symlink test above.
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                with os.fdopen(fd, "rb") as f:
+                    return f.read()
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
         except (FileNotFoundError, NotADirectoryError):
             return None
         except StorageError:
