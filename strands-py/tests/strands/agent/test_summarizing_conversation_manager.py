@@ -1407,3 +1407,71 @@ def test_summarization_agent_path_joins_the_request():
     manager.reduce_context(agent, e=ContextWindowOverflowException("overflow"), invocation_context=handed)
 
     assert request.usage == {"turns_taken": 5, "inputTokens": 4, "outputTokens": 5, "totalTokens": 9}
+
+
+def test_summarization_agent_never_runs_a_tool_and_drops_the_tool_use_reply():
+    """The dedicated summarizer's model is called directly: no tool runs, and its reply's toolUse is dropped."""
+    summary_agent = create_mock_agent()
+    summary_agent.model.stream = Mock(side_effect=lambda *a, **kw: _mock_model_stream_with_tool_use())
+    manager = SummarizingConversationManager(
+        summary_ratio=0.5, preserve_recent_messages=2, summarization_agent=summary_agent
+    )
+
+    messages: Messages = [
+        {"role": "user", "content": [{"text": "Hello"}]},
+        {"role": "assistant", "content": [{"text": "Hi there"}]},
+    ]
+
+    summary = manager._generate_summary(messages, cast("Agent", Mock()))
+
+    # The agent pipeline was never invoked, so nothing could run a tool.
+    summary_agent.call_tracker.assert_not_called()
+    # The reply's toolUse block is dropped: the summary keeps the text only.
+    assert summary["content"] == [{"text": "Summary without the tool call"}]
+
+
+def test_summarization_agent_prompt_ends_with_the_conversation_ended_instruction():
+    """A range ending on a user request is summarized, not continued."""
+    summary_agent = create_mock_agent()
+    manager = SummarizingConversationManager(
+        summary_ratio=0.5, preserve_recent_messages=2, summarization_agent=summary_agent
+    )
+
+    messages: Messages = [
+        {"role": "user", "content": [{"text": "Hello"}]},
+        {"role": "assistant", "content": [{"text": "Hi there"}]},
+    ]
+
+    manager._generate_summary(messages, cast("Agent", Mock()))
+
+    sent_messages = summary_agent.model.stream.call_args[0][0]
+    final_message = sent_messages[-1]
+    assert final_message["role"] == "user"
+    texts = [block["text"] for block in final_message["content"]]
+    assert any("has ended" in text for text in texts)
+    assert any("Do not continue it" in text for text in texts)
+
+
+def test_summarization_agent_tool_specs_are_passed_as_a_spec_only():
+    """The agent's tool specs reach the model, so the provider gets a spec, but no tool is ever run."""
+    summary_agent = create_mock_agent()
+    summary_agent.tool_registry = Mock()
+    summary_agent.tool_registry.get_all_tool_specs = Mock(
+        return_value=[{"name": "noop", "description": "A fake tool.", "inputSchema": {"json": {"type": "object"}}}]
+    )
+    manager = SummarizingConversationManager(
+        summary_ratio=0.5, preserve_recent_messages=2, summarization_agent=summary_agent
+    )
+
+    messages: Messages = [
+        {"role": "user", "content": [{"text": "Hello"}]},
+        {"role": "assistant", "content": [{"text": "Hi there"}]},
+    ]
+
+    manager._generate_summary(messages, cast("Agent", Mock()))
+
+    tool_specs = summary_agent.model.stream.call_args[0][1]
+    assert tool_specs is not None
+    assert [spec["name"] for spec in tool_specs] == ["noop"]
+    # The agent pipeline was never invoked, so the spec cannot have been run.
+    summary_agent.call_tracker.assert_not_called()

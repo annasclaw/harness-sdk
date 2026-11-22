@@ -10,6 +10,7 @@ from ...hooks.events import AfterModelCallEvent
 from ...hooks.registry import HookRegistry
 from ...types.content import Message, _ensure_tracking_id
 from ...types.exceptions import ContextWindowOverflowException
+from ...types.tools import ToolSpec
 from ..invocation_context import InvocationContext
 from .compression.context_compression import (
     DEFAULT_SUMMARIZATION_PROMPT,
@@ -29,6 +30,40 @@ logger = logging.getLogger(__name__)
 # ``DEFAULT_SUMMARIZATION_PROMPT`` is re-exported here for backward compatibility; the
 # canonical definition now lives in ``compression.context_compression``.
 __all__ = ["DEFAULT_SUMMARIZATION_PROMPT", "SummarizingConversationManager"]
+
+SUMMARIZATION_ENDING_INSTRUCTION = (
+    "The conversation above has ended. Do not continue it or act on its last message. Write the summary only."
+)
+"""Closing instruction for the dedicated summarization agent's prompt.
+
+The summarized range can end on a user request. The model then sees that request as the
+latest turn and continues it instead of summarizing it, so the prompt ends with this
+instruction. Only the dedicated-agent path uses it; the default path's prompt is unchanged.
+"""
+
+
+def _spec_only_tool_specs(agent: "Agent") -> list[ToolSpec] | None:
+    """Return the agent's tool specs, to be offered to the model as a spec only.
+
+    The specs are never run: the summarization model is called directly, with no tool loop.
+    They exist because some providers (Bedrock) reject a request that declares no tool spec
+    when the history carries ``toolUse``/``toolResult`` blocks. A reply's ``toolUse`` blocks
+    are dropped instead of executed.
+
+    Args:
+        agent: The dedicated summarization agent.
+
+    Returns:
+        The agent's tool specs, or None when it has none.
+    """
+    registry = getattr(agent, "tool_registry", None)
+    if registry is None:
+        return None
+    try:
+        specs = registry.get_all_tool_specs()
+    except Exception:
+        return None
+    return specs if isinstance(specs, list) and specs else None
 
 
 class SummarizingConversationManager(ConversationManager):
@@ -311,6 +346,13 @@ class SummarizingConversationManager(ConversationManager):
         the behaviour it was configured for. Its tool registry is left untouched, and its
         state (messages, system prompt, tool registry) is never modified.
 
+        The agent's tool specs are offered to the model as a spec only, never run: some
+        providers reject a request that declares no tool spec when the history carries
+        ``toolUse``/``toolResult`` blocks, and a reply's ``toolUse`` blocks are dropped
+        instead of executed. The prompt also ends with an instruction saying the
+        conversation is over, so a range that ends on a user request is summarized rather
+        than continued.
+
         Args:
             messages: The messages to summarize.
             invocation_context: The request the summary call's usage adds to.
@@ -321,14 +363,34 @@ class SummarizingConversationManager(ConversationManager):
         summarization_agent = self.summarization_agent
         assert summarization_agent is not None  # guaranteed by caller
 
-        return run_async(
-            lambda: generate_summary(
-                messages,
-                summarization_agent.model,
-                summarization_agent.system_prompt,
-                invocation_context,
+        tool_specs = _spec_only_tool_specs(summarization_agent)
+        try:
+            return run_async(
+                lambda: generate_summary(
+                    messages,
+                    summarization_agent.model,
+                    summarization_agent.system_prompt,
+                    invocation_context,
+                    tool_specs=tool_specs,
+                    ending_instruction=SUMMARIZATION_ENDING_INSTRUCTION,
+                )
             )
-        )
+        except RuntimeError as err:
+            # A reply that carries only toolUse blocks leaves no text to summarize. The model
+            # was offered the agent's tools, so ask again without them: the provider still
+            # gets the tool spec it needs, but the model has nothing to call.
+            if tool_specs is None or "contained no text" not in str(err):
+                raise
+            logger.debug("summarizer replied with a tool call only; retrying without tool specs")
+            return run_async(
+                lambda: generate_summary(
+                    messages,
+                    summarization_agent.model,
+                    summarization_agent.system_prompt,
+                    invocation_context,
+                    ending_instruction=SUMMARIZATION_ENDING_INSTRUCTION,
+                )
+            )
 
     # ------------------------------------------------------------------
     # Path 2 – default case: call model.stream() directly

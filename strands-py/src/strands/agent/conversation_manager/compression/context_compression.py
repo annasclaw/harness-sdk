@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal
 from ....models._model_proxy import ModelProxy
 from ....types.content import ContentBlock, Message
 from ....types.exceptions import ContextWindowOverflowException
+from ....types.tools import ToolSpec
 
 if TYPE_CHECKING:
     from ....agent.invocation_context import InvocationContext
@@ -152,6 +153,8 @@ async def generate_summary(
     model: "Model",
     system_prompt: str | None = None,
     invocation_context: "InvocationContext | None" = None,
+    tool_specs: list[ToolSpec] | None = None,
+    ending_instruction: str | None = None,
 ) -> Message:
     """Generate a summary of the provided messages by calling the model directly.
 
@@ -164,6 +167,15 @@ async def generate_summary(
         system_prompt: Optional system prompt override. Defaults to
             :data:`DEFAULT_SUMMARIZATION_PROMPT`.
         invocation_context: The request the summary call's usage adds to.
+        tool_specs: Tool specifications offered to the model as a spec only. The model may
+            answer with a ``toolUse`` block, but nothing is ever run: the call goes straight
+            to the model, with no tool loop, and the reply's tool-use blocks are dropped.
+            Some providers (Bedrock) reject a request that declares no tool spec when the
+            history carries ``toolUse``/``toolResult`` blocks, so a caller whose history
+            holds tool traffic passes the specs that satisfy the provider requirement.
+        ending_instruction: Optional extra instruction appended to the final user message,
+            after the standard "please summarize" request. Use it when the summarized range
+            ends on a user request, so the model does not treat that request as live.
 
     Returns:
         A user-role message containing the model-generated summary.
@@ -173,13 +185,14 @@ async def generate_summary(
     """
     resolved_system_prompt = system_prompt if system_prompt is not None else DEFAULT_SUMMARIZATION_PROMPT
 
-    summarization_messages = list(messages_to_summarize) + [
-        {"role": "user", "content": [{"text": "Please summarize this conversation."}]}
-    ]
+    instruction_blocks: list[ContentBlock] = [{"text": "Please summarize this conversation."}]
+    if ending_instruction:
+        instruction_blocks.append({"text": ending_instruction})
+    summarization_messages = list(messages_to_summarize) + [{"role": "user", "content": instruction_blocks}]
 
     result_message: Message | None = None
     async for event in ModelProxy(model).stream(
-        summarization_messages, None, resolved_system_prompt, invocation_context=invocation_context
+        summarization_messages, tool_specs, resolved_system_prompt, invocation_context=invocation_context
     ):
         if "stop" in event:
             _, result_message, _, _ = event["stop"]
